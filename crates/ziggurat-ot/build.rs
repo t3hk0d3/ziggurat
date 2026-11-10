@@ -5,6 +5,7 @@ fn main() {
     // the include/ziggurat.h write below, rebuilding forever.
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/platform.rs");
+    println!("cargo:rerun-if-changed=src/zloe.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
     cbindgen::generate(&crate_dir)

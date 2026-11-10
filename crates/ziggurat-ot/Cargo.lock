@@ -1443,6 +1443,7 @@ dependencies = [
  "cortex-m",
  "critical-section",
  "embassy-executor",
+ "embassy-futures",
  "embassy-sync",
  "embassy-time",
  "embassy-time-driver",
@@ -1454,6 +1455,7 @@ dependencies = [
  "ziggurat-phy",
  "ziggurat-phy-otlink",
  "ziggurat-zigbee",
+ "ziggurat-zloe-core",
 ]
 
 [[package]]
@@ -1503,6 +1505,15 @@ dependencies = [
  "thiserror",
  "tracing",
  "ziggurat-ieee-802154",
+]
+
+[[package]]
+name = "ziggurat-zloe-core"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "ziggurat-ieee-802154",
+ "ziggurat-phy",
 ]
 
 [[package]]

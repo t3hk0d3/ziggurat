@@ -15,9 +15,11 @@ ziggurat-ieee-802154 = { path = "../ziggurat-ieee-802154" }
 ziggurat-zigbee = { path = "../ziggurat-zigbee" }
 ziggurat-driver = { path = "../ziggurat-driver", default-features = false, features = ["embassy"] }
 ziggurat-ncp-api = { path = "../ziggurat-ncp-api" }
+ziggurat-zloe-core = { path = "../ziggurat-zloe-core", optional = true }
 # No arch/executor feature: the raw executor is polled from OpenThread's superloop via
 # ziggurat_process(), with __pender provided here.
 embassy-executor = "0.10"
+embassy-futures = { version = "0.1", optional = true }
 embassy-sync = "0.8"
 embassy-time = "0.5"
 embassy-time-driver = "0.2"
@@ -36,6 +38,8 @@ riscv = { version = "0.16", features = ["critical-section-single-hart"], optiona
 efr32 = ["dep:cortex-m"]
 # ESP-IDF (firmwares/esp32-c6): allocate from the IDF heap.
 esp-idf = ["dep:riscv"]
+# SPIKE: the ZLOE backbone around the radio; the firmware glue owns the socket and discovery.
+zloe = ["dep:ziggurat-zloe-core", "dep:embassy-futures"]
 
 [build-dependencies]
 cbindgen = "0.29"

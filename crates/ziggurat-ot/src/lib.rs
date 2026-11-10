@@ -30,6 +30,8 @@ mod crypto;
 mod link_ops;
 mod platform;
 mod time_driver;
+#[cfg(feature = "zloe")]
+mod zloe;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -279,7 +281,10 @@ static PLATFORM: OtPlatform = OtPlatform;
 
 #[embassy_executor::task]
 async fn ziggurat_main(spawner: embassy_executor::SendSpawner) {
+    #[cfg(not(feature = "zloe"))]
     let phy = Arc::new(OtLinkPhy::new(&LINK_OPS));
+    #[cfg(feature = "zloe")]
+    let phy = Arc::new(zloe::ZloePhy::new(OtLinkPhy::new(&LINK_OPS)));
 
     let mut app = App {
         phy,
@@ -340,6 +345,8 @@ pub extern "C" fn ziggurat_start() {
         platform::ziggurat_platform_entropy(buf.as_mut_ptr(), buf.len());
     }));
     crypto::init();
+    #[cfg(feature = "zloe")]
+    zloe::init();
 
     let spawner = executor::init();
     let send_spawner = spawner.make_send();

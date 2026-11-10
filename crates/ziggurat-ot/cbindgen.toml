@@ -15,6 +15,11 @@ header = """/*
 [export.rename]
 "ZigguratRadioConfig" = "ziggurat_radio_config_t"
 "ZigguratTxStatus" = "ziggurat_tx_status"
+"ZigguratZloeAddr" = "ziggurat_zloe_addr_t"
+"ZigguratZloePeer" = "ziggurat_zloe_peer_t"
+
+[defines]
+"feature = zloe" = "ZIGGURAT_ZLOE"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
