@@ -153,3 +153,34 @@ lwIP transport (C glue)
 - New ESP32-C6 (in hand): UART relay and Wi-Fi coexistence.
 - SPI Ethernet module (W5500 or DM9051) with jumper wires: SPI Ethernet.
 - Second ESP32 with Wi-Fi, wired to the C6 over SPI: esp-hosted.
+
+## Result: ESP32-P4 satellite (2026-11-11)
+
+Built first on the ESP32-P4 (`t3hk0d3/esp32-p4-otbr`, branch `feat/zloe-satellite-488390`), not the C6 the phases above
+target: its Ethernet and RAM take the transport and memory questions out of the first test. `ZloeCore` is the crate
+`ziggurat-zloe-core`; locks, clocks and sockets are traits (`CoreLock`, `Clock`, `BackboneTransport`). The bootstrap is C
+on the board, a local client of the control protocol.
+
+Setup: P4 with an OllyZig (CC2652P, OpenThread RCP) on channel 20, Thread still running on the built-in C6; host
+coordinator and two host satellites in `--zloe-security none`, ZHA on the coordinator. The board has IPv6 link-local
+only (one raw lwIP UDP PCB, no socket) and announces no `mc`, so it gets unicast copies of broadcasts.
+
+| Check | Result |
+|---|---|
+| Bootstrap | clock, mDNS, `NETINFO`, `Configure`, `StartNetwork`, `Device_annce` within about 2 s of the network coming up |
+| Timeout | with no coordinator reachable, `failed` / `no coordinator` after 60 s |
+| Backbone link | coordinator `[diag]`: LQA 255, cost 1/1, stable for 20+ minutes |
+| `Mgmt_Lqi` to the board | 49 ms round trip |
+| ZHA topology scan | lists the board as a router, no failed scans |
+| Forced route (target denied on the three host nodes) | On/Off 10/10 acknowledged, 40–94 ms; all 46 coordinator backbone transmissions went to the board |
+| Radio over the run | 1883 frames received, 768 sent; no drops, no-acks or RCP resets |
+
+Footprint (test build, Thread and satellite together): image 2.8 MB of an 8 MB slot; static DIRAM 247 KB of 572 KB;
+internal heap 149 KB free, lowest 105 KB; stack heap in PSRAM 15 KB, peak 18 KB.
+
+Trap: link-local and mDNS need one L2 segment. The board started on VLAN 1 and the bench on VLAN 10, and the satellite
+found nothing until the board moved to VLAN 10.
+
+Open gaps: unauthenticated only; IPv6 only; no multicast; no joins or children through the satellite; peers are never
+removed when their mDNS record goes away (sends fall back to the radio after the retries); a coordinator that changes
+network settings needs a satellite reboot; no soak run.
