@@ -27,10 +27,10 @@
 pub mod quic;
 pub mod security;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -38,40 +38,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use ziggurat_ieee_802154::types::{Eui64, Nwk};
 use ziggurat_phy::{RadioConfig, RadioError, RadioPhy, Receiver, RxFrame, TxFrame, TxResult};
+use ziggurat_zloe_core::{
+    ACK_TIMEOUT_MS, ATTEMPTS, AckOutcome, BackboneTransport, Clock, CoreLock, FLAG_ACK_REQUEST,
+    Identity, Inbound, KIND_NETINFO_REQ, KIND_NETINFO_RSP, MAC_FRAME_DATA, MacAddress, MacHeader,
+    Resolved, V4, V6, VERSION, ZloeCore, ZloeState,
+};
 
 pub const SERVICE_TYPE: &str = "_zloe._udp.local.";
-const MAGIC: [u8; 2] = *b"ZL";
-const VERSION: u8 = 2;
-const HEADER_LEN: usize = 27;
-const KIND_DATA: u8 = 0;
-const KIND_ACK: u8 = 1;
-/// Trusted-backbone bootstrap: ask a coordinator for the network settings, and its
-/// answer (an encoded `NetworkInfoPayload`, opaque to this crate).
-const KIND_NETINFO_REQ: u8 = 2;
-const KIND_NETINFO_RSP: u8 = 3;
 
 /// Produces the encoded network settings a coordinator hands to satellites.
 pub type NetInfoProvider = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
-const FLAG_ACK_REQUEST: u8 = 0x01;
-/// Multicast liveness probe: no payload, answered with a unicast ack.
-const KIND_PROBE: u8 = 4;
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
-/// A peer that has not acked a probe for this long (two missed probes) gets unicast
-/// copies of broadcasts again.
-const MCAST_CONFIRM_WINDOW: Duration = Duration::from_secs(12);
-/// 802.15.4 frame type "data": the only broadcasts that belong on the backbone.
-const MAC_FRAME_DATA: u8 = 1;
-
-const ACK_TIMEOUT: Duration = Duration::from_millis(50);
-const ATTEMPTS: usize = 3;
-const DEDUP_WINDOW: usize = 64;
-/// RSSI reported for frames received over the backbone.
-const BACKBONE_RSSI: i8 = -20;
-/// A peer whose datagrams arrived this recently has a live backbone link: its
-/// over-the-air frames are duplicates (two Link Status periods).
-const BACKBONE_LIVE: Duration = Duration::from_secs(35);
-/// Weight of the newest sample in the backbone ack-success average.
-const HEALTH_ALPHA: f32 = 0.125;
+const ACK_TIMEOUT: Duration = Duration::from_millis(ACK_TIMEOUT_MS);
 
 #[derive(Debug, Clone, Default)]
 pub struct DenyList {
@@ -148,147 +126,87 @@ fn local_net(name: &str) -> std::io::Result<LocalNet> {
     Ok(LocalNet { index, v4 })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerSource {
-    Mdns,
-    Learned,
-}
-
-#[derive(Debug, Clone)]
-struct Peer {
-    addr: SocketAddr,
-    nwk: Option<Nwk>,
-    source: PeerSource,
-    last_rx: Option<Instant>,
-    /// Backbone ack success, exponentially averaged (1.0 = clean)
-    health: f32,
-    /// Every usable address mDNS gave, best first: tried in turn when sends fail
-    alternates: Vec<SocketAddr>,
-    /// The multicast group and port the peer listens on (mDNS TXT `mc`), scoped to
-    /// our backbone interface. `None`: the peer cannot be reached by multicast.
-    mcast: [Group; 2],
-    /// QUIC port the peer announced (TXT `qp`), secure mode only
-    quic_port: Option<u16>,
-    /// The confirmation state last logged, to log each change once
-    mcast_logged_ok: bool,
-}
-
-impl Peer {
-    fn new(addr: SocketAddr, nwk: Option<Nwk>, source: PeerSource) -> Self {
-        Self {
-            addr,
-            nwk,
-            source,
-            last_rx: None,
-            health: 1.0,
-            alternates: Vec::new(),
-            mcast: [Group::default(), Group::default()],
-            quic_port: None,
-            mcast_logged_ok: false,
-        }
-    }
-
-    /// The group our multicast reaches this peer through, by preference: a group the
-    /// peer announced and has acked a recent probe on.
-    fn multicast_group(&self, prefer_ipv4: bool) -> Option<SocketAddr> {
-        let order = if prefer_ipv4 { [V4, V6] } else { [V6, V4] };
-        order
-            .into_iter()
-            .find(|&f| self.mcast[f].confirmed())
-            .and_then(|f| self.mcast[f].addr)
-    }
-
-    /// The current address went unanswered: move to the next advertised one.
-    fn rotate(&mut self) {
-        if self.alternates.len() < 2 {
-            return;
-        }
-        let next = self
-            .alternates
-            .iter()
-            .position(|a| *a == self.addr)
-            .map_or(0, |i| (i + 1) % self.alternates.len());
-        tracing::info!(
-            "ZLOE: {} unanswered, trying {}",
-            self.addr,
-            self.alternates[next]
-        );
-        self.addr = self.alternates[next];
-    }
-
-    fn live(&self) -> bool {
-        self.last_rx.is_some_and(|t| t.elapsed() < BACKBONE_LIVE)
-    }
-
-    fn lqi(&self) -> u8 {
-        (self.health * 255.0).round().clamp(1.0, 255.0) as u8
-    }
-
-    fn record(&mut self, acked: bool) {
-        let sample = if acked { 1.0 } else { 0.0 };
-        self.health += HEALTH_ALPHA * (sample - self.health);
-    }
-}
-
-/// Our identity on the backbone: complete once both the radio configuration (address,
-/// channel) and the network's extended PAN ID are known.
-/// Index into per-family multicast state.
-const V6: usize = 0;
-const V4: usize = 1;
-
-/// One multicast group a peer announced, and whether our probes reach it there.
-#[derive(Debug, Clone, Copy, Default)]
-struct Group {
-    /// Scoped to our backbone interface (IPv6) or plain (IPv4)
-    addr: Option<SocketAddr>,
-    /// When the peer last acked one of our probes on this group
-    acked: Option<Instant>,
-}
-
-impl Group {
-    fn confirmed(&self) -> bool {
-        self.addr.is_some()
-            && self
-                .acked
-                .is_some_and(|t| t.elapsed() < MCAST_CONFIRM_WINDOW)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Identity {
-    eui64: Eui64,
-    nwk: Nwk,
-    epan: Eui64,
-    channel: u8,
-}
-
+/// The core's state and what only the host keeps next to it.
 #[derive(Default)]
 struct Shared {
-    identity: Option<Identity>,
-    /// Radio half of the identity, from `reconfigure`
-    radio: Option<(Eui64, Nwk, u8)>,
-    /// Network half, from `set_extended_pan_id`
-    epan: Option<Eui64>,
-    peers: HashMap<Eui64, Peer>,
-    /// Recently delivered (sender, backbone seq), to drop retransmits of a frame whose
-    /// ack was lost.
-    seen: HashMap<Eui64, VecDeque<u32>>,
+    core: ZloeState,
     rx_tx: Option<mpsc::Sender<RxFrame>>,
     mdns_fullname: Option<String>,
-    /// Coordinators seen on the backbone (mDNS `role=coordinator`), kept even before
-    /// we have an identity of our own: satellites bootstrap from them
-    coordinators: HashMap<Eui64, (SocketAddr, Option<Eui64>)>,
-    /// Everything mDNS resolved, by extended address
-    resolved: HashMap<Eui64, Resolved>,
-    /// Secure (QUIC) mode
-    secure: bool,
-    /// QUIC ports of coordinators seen on the backbone (enrollment targets)
-    coordinator_quic: HashMap<Eui64, u16>,
     netinfo_provider: Option<NetInfoProvider>,
     netinfo_waiter: Option<oneshot::Sender<Vec<u8>>>,
-    /// Packet numbers of our latest multicast probes, with their family
-    probes: VecDeque<(u32, usize)>,
 }
+
+/// [`CoreLock`] over the shared state.
+struct HostLock(Arc<Mutex<Shared>>);
+
+impl CoreLock for HostLock {
+    fn with<R>(&self, f: impl FnOnce(&mut ZloeState) -> R) -> R {
+        f(&mut self.0.lock().core)
+    }
+}
+
+/// [`Clock`] counting from when the backbone was made.
+#[derive(Clone, Copy)]
+struct HostClock(Instant);
+
+impl Clock for HostClock {
+    fn now_ms(&self) -> u64 {
+        self.0.elapsed().as_millis() as u64
+    }
+}
+
+type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>;
+
+/// [`BackboneTransport`] over the UDP socket.
+struct UdpTransport {
+    socket: Arc<UdpSocket>,
+    pending: Pending,
+    dual_stack: bool,
+}
+
+impl BackboneTransport for UdpTransport {
+    async fn send(&self, to: SocketAddr, datagram: &[u8]) -> bool {
+        self.socket
+            .send_to(datagram, to_family(to, self.dual_stack))
+            .await
+            .is_ok()
+    }
+
+    async fn send_wait_ack(
+        &self,
+        to: SocketAddr,
+        datagram: &[u8],
+        seq: u32,
+        timeout_ms: u64,
+    ) -> AckOutcome {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(seq, tx);
+        let outcome = if self
+            .socket
+            .send_to(datagram, to_family(to, self.dual_stack))
+            .await
+            .is_err()
+        {
+            AckOutcome::SendFailed
+        } else if tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .is_ok()
+        {
+            AckOutcome::Acked
+        } else {
+            AckOutcome::TimedOut
+        };
+        self.pending.lock().remove(&seq);
+        outcome
+    }
+
+    fn complete_ack(&self, seq: u32) -> bool {
+        let waiter = self.pending.lock().remove(&seq);
+        waiter.is_some_and(|w| w.send(()).is_ok())
+    }
+}
+
+type Core = ZloeCore<HostLock, HostClock, UdpTransport>;
 
 /// Datagram counters, for the bench.
 #[derive(Default)]
@@ -305,8 +223,8 @@ struct Stats {
 struct Backbone {
     socket: Arc<UdpSocket>,
     shared: Arc<Mutex<Shared>>,
-    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
-    seq: Arc<AtomicU32>,
+    core: Arc<Core>,
+    pending: Pending,
     stats: Arc<Stats>,
     mcast_block_file: Option<std::path::PathBuf>,
     static_peers: Vec<SocketAddr>,
@@ -330,6 +248,7 @@ pub struct TrelPhy<P: RadioPhy> {
     backbone: Option<Backbone>,
     deny: DenyList,
     shared: Arc<Mutex<Shared>>,
+    clock: HostClock,
 }
 
 /// The merged received-frame stream.
@@ -344,7 +263,11 @@ impl Receiver<RxFrame> for TrelRx {
 impl<P: RadioPhy> TrelPhy<P> {
     /// Must be called from within a Tokio runtime.
     pub async fn new(inner: P, config: TrelConfig) -> std::io::Result<Self> {
-        let shared = Arc::new(Mutex::new(Shared::default()));
+        let shared = Arc::new(Mutex::new(Shared {
+            core: ZloeState::new(rand_u32()),
+            ..Shared::default()
+        }));
+        let clock = HostClock(Instant::now());
 
         let backbone = if config.port == 0 {
             None
@@ -392,17 +315,25 @@ impl<P: RadioPhy> TrelPhy<P> {
                 None
             };
 
+            let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+            let core = Arc::new(ZloeCore::new(
+                HostLock(Arc::clone(&shared)),
+                clock,
+                UdpTransport {
+                    socket: Arc::clone(&socket),
+                    pending: Arc::clone(&pending),
+                    dual_stack,
+                },
+            ));
+
             // Secure mode: QUIC peer links; its datagrams go through the same handler
             let quic = match &config.quic {
                 Some(qc) => {
-                    let (h_shared, h_pending) =
-                        (Arc::clone(&shared), Arc::new(Mutex::new(HashMap::new())));
                     let handler: quic::Handler = {
-                        let h_pending: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>> =
-                            Arc::clone(&h_pending);
-                        let h_shared = Arc::clone(&h_shared);
+                        let h_core = Arc::clone(&core);
+                        let h_shared = Arc::clone(&shared);
                         Arc::new(move |buf: &[u8], from: SocketAddr| {
-                            process_datagram(&h_shared, &h_pending, buf, from, false)
+                            process_datagram(&h_core, &h_shared, buf, from, false)
                         })
                     };
                     let n_shared = Arc::clone(&shared);
@@ -410,25 +341,23 @@ impl<P: RadioPhy> TrelPhy<P> {
                         let provider = n_shared.lock().netinfo_provider.clone();
                         provider.and_then(|provide| provide())
                     });
-                    shared.lock().secure = true;
-                    Some((
-                        quic::QuicLink::new(qc.port, handler, netinfo, qc.code_file.clone())?,
-                        h_pending,
-                    ))
+                    shared.lock().core.secure = true;
+                    Some(quic::QuicLink::new(
+                        qc.port,
+                        handler,
+                        netinfo,
+                        qc.code_file.clone(),
+                    )?)
                 }
                 None => None,
-            };
-            let (quic, pending) = match quic {
-                Some((link, pending)) => (Some(link), pending),
-                None => (None, Arc::new(Mutex::new(HashMap::new()))),
             };
 
             let backbone = Backbone {
                 quic,
                 socket,
                 shared: Arc::clone(&shared),
+                core,
                 pending,
-                seq: Arc::new(AtomicU32::new(rand_u32())),
                 stats: Arc::new(Stats::default()),
                 mcast_block_file: config.mcast_block_file,
                 static_peers: config.static_peers,
@@ -456,6 +385,7 @@ impl<P: RadioPhy> TrelPhy<P> {
             backbone,
             deny: config.deny,
             shared,
+            clock,
         })
     }
 
@@ -466,11 +396,7 @@ impl<P: RadioPhy> TrelPhy<P> {
     /// The network's extended PAN ID (TREL's `xp` in mDNS): peers on other networks are
     /// ignored. Set by the stack's owner when the network is configured.
     pub fn set_extended_pan_id(&self, epan: Eui64) {
-        let identity = {
-            let mut shared = self.shared.lock();
-            shared.epan = Some(epan);
-            update_identity(&mut shared)
-        };
+        let identity = self.shared.lock().core.set_epan(epan);
         if let (Some(identity), Some(backbone)) = (identity, &self.backbone) {
             backbone.advertise(identity);
         }
@@ -525,11 +451,13 @@ impl<P: RadioPhy> TrelPhy<P> {
             let target = {
                 let shared = self.shared.lock();
                 shared
+                    .core
                     .coordinators
                     .iter()
                     .filter(|(_, (_, e))| epan.is_none() || *e == epan)
                     .find_map(|(eui64, (addr, _))| {
                         shared
+                            .core
                             .coordinator_quic
                             .get(eui64)
                             .map(|qp| (*eui64, with_port(*addr, *qp)))
@@ -571,6 +499,7 @@ impl<P: RadioPhy> TrelPhy<P> {
             let candidates: Vec<(Eui64, SocketAddr, Option<Eui64>)> = {
                 let shared = self.shared.lock();
                 shared
+                    .core
                     .coordinators
                     .iter()
                     .filter(|(_, (_, x))| epan.is_none() || *x == epan)
@@ -590,13 +519,16 @@ impl<P: RadioPhy> TrelPhy<P> {
             }
 
             let (tx, rx) = oneshot::channel();
-            self.shared.lock().netinfo_waiter = Some(tx);
-            let seq = backbone.seq.fetch_add(1, Ordering::Relaxed);
-            let request = netinfo_header(KIND_NETINFO_REQ, seq, None);
+            let request = {
+                let mut shared = self.shared.lock();
+                shared.netinfo_waiter = Some(tx);
+                let seq = shared.core.next_seq();
+                shared.core.netinfo_header(KIND_NETINFO_REQ, seq)
+            };
             tracing::info!("ZLOE: asking coordinator {eui64:?} at {addr} for network settings");
             backbone
                 .socket
-                .send_to(&request, backbone.target(addr))
+                .send_to(&request, to_family(addr, backbone.dual_stack))
                 .await?;
             if let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(1), rx).await {
                 return Ok(info);
@@ -612,238 +544,44 @@ impl<P: RadioPhy> TrelPhy<P> {
 /// Handle one ZLOE datagram (from UDP or a QUIC link); returns the reply to send back
 /// to `from` (an ack or the network settings), if any.
 fn process_datagram(
+    core: &Core,
     shared: &Mutex<Shared>,
-    pending: &Mutex<HashMap<u32, oneshot::Sender<()>>>,
     buf: &[u8],
     from: SocketAddr,
     allow_netinfo: bool,
 ) -> Option<Vec<u8>> {
-    let Some(header) = WireHeader::parse(buf) else {
-        tracing::debug!("ZLOE: dropping malformed datagram from {from}");
-        return None;
-    };
-
-    if header.kind == KIND_ACK {
-        let waiter = pending.lock().remove(&header.seq);
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(());
-        } else {
-            // Not a unicast we are waiting on: an answer to a probe?
-            let mut shared = shared.lock();
-            let family = shared
-                .probes
-                .iter()
-                .find(|(seq, _)| *seq == header.seq)
-                .map(|(_, f)| *f);
-            if let Some(family) = family
-                && let Some(peer) = shared.peers.get_mut(&header.eui64)
-            {
-                peer.mcast[family].acked = Some(Instant::now());
+    match core.on_datagram(buf, from) {
+        Inbound::Nothing => None,
+        // Bootstrap exchange: the backbone is trusted, so the settings (network
+        // key included) go to whoever asks
+        Inbound::NetinfoRequest { seq, eui64 } => {
+            if !allow_netinfo {
+                return None;
             }
+            let provider = shared.lock().netinfo_provider.clone();
+            let info = provider.and_then(|provide| provide())?;
+            tracing::info!("ZLOE: sending network settings to {from} ({eui64:?})");
+            let mut rsp = shared.lock().core.netinfo_header(KIND_NETINFO_RSP, seq);
+            rsp.extend_from_slice(&info);
+            Some(rsp)
         }
-        return None;
-    }
-
-    // Bootstrap exchange: the backbone is trusted, so the settings (network
-    // key included) go to whoever asks
-    if header.kind == KIND_NETINFO_REQ && allow_netinfo {
-        let (provider, identity) = {
-            let shared = shared.lock();
-            (shared.netinfo_provider.clone(), shared.identity)
-        };
-        let info = provider.and_then(|provide| provide())?;
-        tracing::info!(
-            "ZLOE: sending network settings to {from} ({:?})",
-            header.eui64
-        );
-        let mut rsp = netinfo_header(KIND_NETINFO_RSP, header.seq, identity);
-        rsp.extend_from_slice(&info);
-        return Some(rsp);
-    }
-    if header.kind == KIND_NETINFO_RSP {
-        if let Some(waiter) = shared.lock().netinfo_waiter.take() {
-            let _ = waiter.send(buf[HEADER_LEN..].to_vec());
-        }
-        return None;
-    }
-
-    if header.kind != KIND_DATA && header.kind != KIND_PROBE {
-        return None;
-    }
-    let psdu = buf[HEADER_LEN..].to_vec();
-    let (deliver, ack_to) = {
-        let mut shared = shared.lock();
-        let identity = shared.identity?;
-        if header.epan != identity.epan || header.eui64 == identity.eui64 {
-            return None;
-        }
-
-        // Learn (or refresh) the peer from its own traffic
-        let peer = shared.peers.entry(header.eui64).or_insert_with(|| {
-            tracing::info!(
-                "ZLOE: learned peer {:?} / {:?} at {from}",
-                header.eui64,
-                header.nwk
-            );
-            Peer::new(from, None, PeerSource::Learned)
-        });
-        peer.addr = from;
-        peer.nwk = Some(header.nwk);
-        peer.last_rx = Some(Instant::now());
-        let lqi = peer.lqi();
-
-        // A probe only refreshes the peer and gets its ack
-        let seen = shared.seen.entry(header.eui64).or_default();
-        let duplicate = header.kind == KIND_PROBE || seen.contains(&header.seq);
-        if !duplicate {
-            seen.push_back(header.seq);
-            if seen.len() > DEDUP_WINDOW {
-                seen.pop_front();
+        Inbound::NetinfoResponse(info) => {
+            if let Some(waiter) = shared.lock().netinfo_waiter.take() {
+                let _ = waiter.send(info);
             }
+            None
         }
-
-        let ack_to = (header.flags & FLAG_ACK_REQUEST != 0).then_some(from);
-        let deliver = (!duplicate).then(|| {
-            (
-                shared.rx_tx.clone(),
-                RxFrame {
-                    psdu,
-                    channel: identity.channel,
-                    rssi: BACKBONE_RSSI,
-                    lqi,
-                    timestamp_us: 0,
-                },
-            )
-        });
-        (deliver, ack_to.map(|to| (to, identity)))
-    };
-
-    if let Some((Some(tx), frame)) = deliver {
-        tracing::trace!(
-            "ZLOE: rx {} bytes from {:?}",
-            frame.psdu.len(),
-            header.eui64
-        );
-        let _ = tx.try_send(frame);
-    }
-    if let Some((_, identity)) = ack_to {
-        let ack = WireHeader {
-            kind: KIND_ACK,
-            flags: 0,
-            seq: header.seq,
-            eui64: identity.eui64,
-            nwk: identity.nwk,
-            epan: identity.epan,
-        }
-        .to_bytes();
-        return Some(ack);
-    }
-    None
-}
-
-/// Header for the bootstrap messages, sent before we may have an identity.
-fn netinfo_header(kind: u8, seq: u32, identity: Option<Identity>) -> Vec<u8> {
-    WireHeader {
-        kind,
-        flags: 0,
-        seq,
-        eui64: identity.map_or(Eui64([0; 8]), |i| i.eui64),
-        nwk: identity.map_or(Nwk(0xFFFF), |i| i.nwk),
-        epan: identity.map_or(Eui64([0; 8]), |i| i.epan),
-    }
-    .to_bytes()
-}
-
-/// What mDNS last told us about a node.
-#[derive(Debug, Clone)]
-struct Resolved {
-    epan: Option<Eui64>,
-    nwk: Option<Nwk>,
-    /// Usable addresses, best first, with their rank
-    candidates: Vec<((u8, u8), SocketAddr)>,
-    /// Announced groups: [IPv6 (`mc`), IPv4 (`mc4`)]
-    mcast: [Option<SocketAddr>; 2],
-    /// Security mode (`sec`) and QUIC port (`qp`)
-    quic_port: Option<u16>,
-}
-
-/// Create or update the peer for a resolved node on our network.
-fn apply_resolved(shared: &mut Shared, eui64: Eui64) {
-    let Some(identity) = shared.identity else {
-        return;
-    };
-    let Some(resolved) = shared.resolved.get(&eui64).cloned() else {
-        return;
-    };
-    if eui64 == identity.eui64 || resolved.epan != Some(identity.epan) {
-        return;
-    }
-    // A secure node only peers with secure nodes, and the other way around
-    if shared.secure != resolved.quic_port.is_some() {
-        return;
-    }
-    let Some(&(best_key, addr)) = resolved.candidates.first() else {
-        return;
-    };
-    let nwk = resolved.nwk;
-
-    let peer = shared.peers.entry(eui64).or_insert_with(|| {
-        tracing::info!("ZLOE: mDNS peer {eui64:?} / {nwk:?} at {addr}");
-        Peer::new(addr, nwk, PeerSource::Mdns)
-    });
-    // Once the peer has talked to us, its datagrams' source address is authoritative.
-    // Until then follow mDNS, but only to a strictly better address: answers trickle
-    // in per interface and would make it flap
-    let current_key = resolved
-        .candidates
-        .iter()
-        .find(|(_, a)| *a == peer.addr)
-        .map(|(k, _)| *k);
-    peer.alternates = resolved.candidates.iter().map(|(_, a)| *a).collect();
-    peer.quic_port = resolved.quic_port;
-    for family in [V6, V4] {
-        if peer.mcast[family].addr != resolved.mcast[family] {
-            tracing::info!(
-                "ZLOE: peer {eui64:?} multicast: {:?}",
-                resolved.mcast[family]
-            );
-            peer.mcast[family] = Group {
-                addr: resolved.mcast[family],
-                acked: None,
-            };
+        Inbound::Data { frame, reply } => {
+            if let Some(frame) = frame {
+                let tx = shared.lock().rx_tx.clone();
+                if let Some(tx) = tx {
+                    tracing::trace!("ZLOE: rx {} bytes from {from}", frame.psdu.len());
+                    let _ = tx.try_send(frame);
+                }
+            }
+            reply
         }
     }
-    if peer.last_rx.is_none() && current_key.is_none_or(|k| best_key < k) {
-        tracing::info!("ZLOE: mDNS peer {eui64:?} moved to {addr}");
-        peer.addr = addr;
-    }
-    if nwk.is_some() {
-        peer.nwk = nwk;
-    }
-}
-
-/// Combine the radio and network halves into the identity, once both are known.
-fn update_identity(shared: &mut Shared) -> Option<Identity> {
-    let (eui64, nwk, channel) = shared.radio?;
-    let epan = shared.epan?;
-    let identity = Identity {
-        eui64,
-        nwk,
-        epan,
-        channel,
-    };
-    let changed = shared.identity.is_none_or(|old| {
-        old.eui64 != identity.eui64 || old.nwk != identity.nwk || old.epan != identity.epan
-    });
-    shared.identity = Some(identity);
-    if changed {
-        // Nodes resolved before we knew our network become peers now
-        let known: Vec<Eui64> = shared.resolved.keys().copied().collect();
-        for eui64 in known {
-            apply_resolved(shared, eui64);
-        }
-    }
-    changed.then_some(identity)
 }
 
 /// One dual-stack IPv6 socket (IPv4 arrives v4-mapped); IPv4-only when the host has no
@@ -892,8 +630,8 @@ impl Backbone {
         block: Option<(std::path::PathBuf, &'static str)>,
     ) -> tokio::task::JoinHandle<()> {
         let socket = Arc::clone(&self.socket);
+        let core = Arc::clone(&self.core);
         let shared = Arc::clone(&self.shared);
-        let pending = Arc::clone(&self.pending);
         let dual_stack = self.dual_stack;
         let secure = self.quic.is_some();
 
@@ -919,7 +657,7 @@ impl Backbone {
                 if secure {
                     continue;
                 }
-                if let Some(reply) = process_datagram(&shared, &pending, &buf[..len], from, true) {
+                if let Some(reply) = process_datagram(&core, &shared, &buf[..len], from, true) {
                     let _ = socket.send_to(&reply, to_family(from, dual_stack)).await;
                 }
             }
@@ -988,27 +726,13 @@ impl Backbone {
                             prefer_ipv4,
                             dual_stack,
                         );
-                        let Some(&(_, addr)) = candidates.first() else {
+                        if candidates.is_empty() {
                             continue;
-                        };
+                        }
 
-                        let mut shared = shared.lock();
-                        if info.get_property_val_str("role") == Some("coordinator")
-                            && let Some(qp) = quic_port
-                        {
-                            shared.coordinator_quic.insert(eui64, qp);
-                        }
-                        if info.get_property_val_str("role") == Some("coordinator") {
-                            let known = shared.coordinators.insert(eui64, (addr, epan));
-                            if known.is_none() {
-                                tracing::info!(
-                                    "ZLOE: coordinator {eui64:?} (epan {epan:?}) at {addr}"
-                                );
-                            }
-                        }
                         // Kept even while we have no identity (a satellite browses
                         // before it knows its network) and applied once we do
-                        shared.resolved.insert(
+                        shared.lock().core.on_resolved(
                             eui64,
                             Resolved {
                                 epan,
@@ -1017,8 +741,8 @@ impl Backbone {
                                 mcast,
                                 quic_port,
                             },
+                            info.get_property_val_str("role") == Some("coordinator"),
                         );
-                        apply_resolved(&mut shared, eui64);
                     }
                     mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => {
                         let Some(eui64) = fullname
@@ -1028,21 +752,7 @@ impl Backbone {
                         else {
                             continue;
                         };
-                        let mut shared = shared.lock();
-                        shared.resolved.remove(&eui64);
-                        if let Some(peer) = shared.peers.get_mut(&eui64) {
-                            // A peer kept alive by its own traffic loses what only
-                            // mDNS told us
-                            peer.mcast = [Group::default(), Group::default()];
-                        }
-                        if shared
-                            .peers
-                            .get(&eui64)
-                            .is_some_and(|p| p.source == PeerSource::Mdns)
-                        {
-                            tracing::info!("ZLOE: mDNS peer {eui64:?} went away");
-                            shared.peers.remove(&eui64);
-                        }
+                        shared.lock().core.on_removed(eui64);
                     }
                     _ => {}
                 }
@@ -1211,7 +921,7 @@ impl Backbone {
     fn spawn_prober(&self) {
         let socket = Arc::clone(&self.socket);
         let shared = Arc::clone(&self.shared);
-        let seq = Arc::clone(&self.seq);
+        let clock = self.core.clock;
         let stats = Arc::clone(&self.stats);
         let prefer_ipv4 = self.prefer_ipv4;
         let dual_stack = self.dual_stack;
@@ -1226,6 +936,7 @@ impl Backbone {
                 if let Some(link) = &quic {
                     let targets: Vec<(Eui64, SocketAddr)> = shared
                         .lock()
+                        .core
                         .peers
                         .iter()
                         .filter_map(|(eui64, p)| {
@@ -1237,70 +948,7 @@ impl Backbone {
                     }
                     continue;
                 }
-                let probes = {
-                    let mut shared = shared.lock();
-                    let Some(identity) = shared.identity else {
-                        continue;
-                    };
-
-                    let mut groups: Vec<(usize, SocketAddr)> = Vec::new();
-                    for (eui64, peer) in &mut shared.peers {
-                        // Probe the preferred group only; the other one only while
-                        // the preferred one is absent or unconfirmed, so a peer can
-                        // fail over without doubling the probe traffic
-                        let order = if prefer_ipv4 { [V4, V6] } else { [V6, V4] };
-                        for family in order {
-                            let Some(group) = peer.mcast[family].addr else {
-                                continue;
-                            };
-                            if !groups.contains(&(family, group)) {
-                                groups.push((family, group));
-                            }
-                            if peer.mcast[family].confirmed() {
-                                break;
-                            }
-                        }
-                        let ok = peer.multicast_group(prefer_ipv4);
-                        if ok.is_some() != peer.mcast_logged_ok {
-                            peer.mcast_logged_ok = ok.is_some();
-                            match ok {
-                                Some(group) => {
-                                    tracing::info!("ZLOE: multicast reaches {eui64:?} via {group}");
-                                }
-                                None => tracing::warn!(
-                                    "ZLOE: multicast does not reach {eui64:?}, \
-                                     sending it unicast copies"
-                                ),
-                            }
-                        }
-                    }
-                    if groups.is_empty() {
-                        continue;
-                    }
-
-                    // One probe per group, so an ack tells which family works
-                    let probes: Vec<(SocketAddr, Vec<u8>)> = groups
-                        .into_iter()
-                        .map(|(family, group)| {
-                            let seq = seq.fetch_add(1, Ordering::Relaxed);
-                            shared.probes.push_back((seq, family));
-                            let probe = WireHeader {
-                                kind: KIND_PROBE,
-                                flags: FLAG_ACK_REQUEST,
-                                seq,
-                                eui64: identity.eui64,
-                                nwk: identity.nwk,
-                                epan: identity.epan,
-                            }
-                            .to_bytes();
-                            (group, probe)
-                        })
-                        .collect();
-                    while shared.probes.len() > 8 {
-                        shared.probes.pop_front();
-                    }
-                    probes
-                };
+                let probes = shared.lock().core.plan_probes(prefer_ipv4, clock.now_ms());
                 for (group, probe) in probes {
                     let _ = socket.send_to(&probe, to_family(group, dual_stack)).await;
                     stats.probes.fetch_add(1, Ordering::Relaxed);
@@ -1309,55 +957,16 @@ impl Backbone {
         });
     }
 
-    fn peer_for(&self, dest: &MacAddress) -> Option<SocketAddr> {
-        let shared = self.shared.lock();
-        match dest {
-            MacAddress::Extended(eui64) => shared.peers.get(eui64).map(|p| p.addr),
-            MacAddress::Short(nwk) => shared
-                .peers
-                .values()
-                .find(|p| p.nwk == Some(*nwk))
-                .map(|p| p.addr),
-            MacAddress::None => None,
-        }
-    }
-
-    fn header(&self, kind: u8, flags: u8, seq: u32) -> Option<Vec<u8>> {
-        let identity = self.shared.lock().identity?;
-        Some(
-            WireHeader {
-                kind,
-                flags,
-                seq,
-                eui64: identity.eui64,
-                nwk: identity.nwk,
-                epan: identity.epan,
-            }
-            .to_bytes(),
-        )
-    }
-
-    /// The address as this socket's family wants it.
-    fn target(&self, addr: SocketAddr) -> SocketAddr {
-        to_family(addr, self.dual_stack)
-    }
-
-    fn record_link(&self, to: SocketAddr, acked: bool) {
-        let mut shared = self.shared.lock();
-        if let Some(peer) = shared.peers.values_mut().find(|p| p.addr == to) {
-            peer.record(acked);
-        }
+    fn peer_eui_for(&self, dest: &MacAddress) -> Option<Eui64> {
+        self.shared.lock().core.peer_eui_for(dest)
     }
 
     async fn send_broadcast(&self, psdu: &[u8]) {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let Some(mut datagram) = self.header(KIND_DATA, 0, seq) else {
-            return;
-        };
-        datagram.extend_from_slice(psdu);
-
         // Secure mode: one QUIC datagram per connected peer
         if let Some(link) = &self.quic {
+            let Some((_, datagram)) = self.shared.lock().core.data_datagram(0, psdu) else {
+                return;
+            };
             self.stats.broadcasts.fetch_add(1, Ordering::Relaxed);
             for peer in link.connected() {
                 if link.send(peer, &datagram) {
@@ -1367,41 +976,17 @@ impl Backbone {
             return;
         }
 
-        // One multicast datagram covers every peer it is known to reach; the others
-        // (no announced address, or probes unanswered) get a unicast copy with the
-        // same packet number, so a peer that receives both keeps one
-        let (groups, copies) = {
-            let shared = self.shared.lock();
-            let mut groups: Vec<SocketAddr> = Vec::new();
-            let mut copies: Vec<SocketAddr> = Vec::new();
-            for peer in shared.peers.values() {
-                match peer.multicast_group(self.prefer_ipv4) {
-                    Some(group) => {
-                        if !groups.contains(&group) {
-                            groups.push(group);
-                        }
-                    }
-                    None => copies.push(peer.addr),
-                }
-            }
-            // Static peers that have not identified themselves yet
-            for addr in &self.static_peers {
-                if !shared.peers.values().any(|p| p.addr == *addr) {
-                    copies.push(*addr);
-                }
-            }
-            (groups, copies)
-        };
-
+        let (groups, copies) = self
+            .core
+            .send_broadcast(psdu, self.prefer_ipv4, &self.static_peers)
+            .await;
         self.stats.broadcasts.fetch_add(1, Ordering::Relaxed);
-        for group in groups {
-            let _ = self.socket.send_to(&datagram, self.target(group)).await;
-            self.stats.multicast.fetch_add(1, Ordering::Relaxed);
-        }
-        for target in copies {
-            let _ = self.socket.send_to(&datagram, self.target(target)).await;
-            self.stats.unicast_copies.fetch_add(1, Ordering::Relaxed);
-        }
+        self.stats
+            .multicast
+            .fetch_add(groups as u64, Ordering::Relaxed);
+        self.stats
+            .unicast_copies
+            .fetch_add(copies as u64, Ordering::Relaxed);
     }
 
     /// Secure mode: unicast over the peer's QUIC link, acked like the UDP path.
@@ -1410,12 +995,11 @@ impl Backbone {
         if !link.is_connected(peer) {
             return false;
         }
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let flags = if ack_request { FLAG_ACK_REQUEST } else { 0 };
-        let Some(mut datagram) = self.header(KIND_DATA, flags, seq) else {
+        let Some((seq, datagram)) = self.shared.lock().core.data_datagram(flags, psdu) else {
             return false;
         };
-        datagram.extend_from_slice(psdu);
+
         if !ack_request {
             return link.send(peer, &datagram);
         }
@@ -1430,57 +1014,6 @@ impl Backbone {
             }
         }
         self.pending.lock().remove(&seq);
-        false
-    }
-
-    fn peer_eui_for(&self, dest: &MacAddress) -> Option<Eui64> {
-        let shared = self.shared.lock();
-        match dest {
-            MacAddress::Extended(eui64) => shared.peers.contains_key(eui64).then_some(*eui64),
-            MacAddress::Short(nwk) => shared
-                .peers
-                .iter()
-                .find(|(_, p)| p.nwk == Some(*nwk))
-                .map(|(e, _)| *e),
-            MacAddress::None => None,
-        }
-    }
-
-    /// Reliable-ish unicast to one peer. `true` once acked.
-    async fn send_unicast(&self, to: SocketAddr, psdu: &[u8], ack_request: bool) -> bool {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let flags = if ack_request { FLAG_ACK_REQUEST } else { 0 };
-        let Some(mut datagram) = self.header(KIND_DATA, flags, seq) else {
-            return false;
-        };
-        datagram.extend_from_slice(psdu);
-
-        let dest = self.target(to);
-        if !ack_request {
-            return self.socket.send_to(&datagram, dest).await.is_ok();
-        }
-
-        for attempt in 0..ATTEMPTS {
-            let (tx, rx) = oneshot::channel();
-            self.pending.lock().insert(seq, tx);
-            if self.socket.send_to(&datagram, dest).await.is_err() {
-                self.record_link(to, false);
-                break;
-            }
-            let acked = tokio::time::timeout(ACK_TIMEOUT, rx).await.is_ok();
-            self.record_link(to, acked);
-            if acked {
-                if attempt > 0 {
-                    tracing::debug!("ZLOE: unicast to {to} acked after {} retries", attempt);
-                }
-                return true;
-            }
-        }
-        self.pending.lock().remove(&seq);
-        tracing::debug!("ZLOE: unicast to {to} not acked");
-        if let Some(peer) = self.shared.lock().peers.values_mut().find(|p| p.addr == to) {
-            peer.rotate();
-        }
         false
     }
 }
@@ -1501,15 +1034,11 @@ impl<P: RadioPhy> RadioPhy for TrelPhy<P> {
         if config.short_address == Nwk(0xFFFF) || config.promiscuous {
             return Ok(());
         }
-        let identity = {
-            let mut shared = self.shared.lock();
-            shared.radio = Some((
-                config.extended_address,
-                config.short_address,
-                config.channel,
-            ));
-            update_identity(&mut shared)
-        };
+        let identity = self.shared.lock().core.set_radio(
+            config.extended_address,
+            config.short_address,
+            config.channel,
+        );
         if let (Some(identity), Some(backbone)) = (identity, &self.backbone) {
             backbone.advertise(identity);
         }
@@ -1546,18 +1075,8 @@ impl<P: RadioPhy> RadioPhy for TrelPhy<P> {
                     }
                     tracing::info!("ZLOE: QUIC to {:?} failed, falling back to air", mac.dest);
                 }
-            } else if let Some(peer) = backbone.peer_for(&mac.dest) {
-                if backbone
-                    .send_unicast(peer, &frame.psdu, mac.ack_request)
-                    .await
-                {
-                    tracing::trace!("ZLOE: tx to {:?} via backbone", mac.dest);
-                    return Ok(TxResult::Acked);
-                }
-                tracing::info!(
-                    "ZLOE: backbone to {:?} failed, falling back to air",
-                    mac.dest
-                );
+            } else if backbone.core.send_to_peer(&mac, &frame.psdu).await {
+                return Ok(TxResult::Acked);
             }
         }
 
@@ -1589,6 +1108,7 @@ impl<P: RadioPhy> RadioPhy for TrelPhy<P> {
         let deny = self.deny.clone();
         let shared = Arc::clone(&self.shared);
         let has_backbone = self.backbone.is_some();
+        let clock = self.clock;
 
         // Over-the-air frames: apply the deny list, and drop copies of what a live
         // backbone peer also sends over the backbone
@@ -1600,19 +1120,10 @@ impl<P: RadioPhy> RadioPhy for TrelPhy<P> {
                         continue;
                     }
                     if has_backbone {
-                        let live_peer = {
-                            let shared = shared.lock();
-                            match &mac.source {
-                                MacAddress::Extended(eui64) => {
-                                    shared.peers.get(eui64).is_some_and(Peer::live)
-                                }
-                                MacAddress::Short(nwk) => shared
-                                    .peers
-                                    .values()
-                                    .any(|p| p.nwk == Some(*nwk) && p.live()),
-                                MacAddress::None => false,
-                            }
-                        };
+                        let live_peer = !shared
+                            .lock()
+                            .core
+                            .keep_air_frame(&mac.source, clock.now_ms());
                         if live_peer {
                             tracing::trace!("ZLOE: dropping air copy from {:?}", mac.source);
                             continue;
@@ -1648,8 +1159,10 @@ impl<P: RadioPhy> TrelPhy<P> {
 
     /// Peers currently known, for diagnostics.
     pub fn peers(&self) -> Vec<String> {
+        let now = self.clock.now_ms();
         self.shared
             .lock()
+            .core
             .peers
             .iter()
             .map(|(eui64, p)| {
@@ -1661,119 +1174,15 @@ impl<P: RadioPhy> TrelPhy<P> {
                     p.lqi(),
                     [V6, V4]
                         .into_iter()
-                        .filter_map(|f| p.mcast[f].addr.map(|a| (a, p.mcast[f].confirmed())))
+                        .filter_map(|f| p.mcast[f].addr.map(|a| (a, p.mcast[f].confirmed(now))))
                         .map(|(a, ok)| format!("{a} {}", if ok { "ok" } else { "unconfirmed" }))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    p.last_rx.map(|t| t.elapsed())
+                    p.last_rx_ms
+                        .map(|t| Duration::from_millis(now.saturating_sub(t)))
                 )
             })
             .collect()
-    }
-}
-
-// -- wire format ---------------------------------------------------------------------
-
-/// `"ZL" | ver=2 | kind | flags | seq:u32le | xa: EUI64 | nwk:u16le | epan: extended PAN ID`
-/// (EUI64s in 802.15.4 wire order, i.e. little-endian)
-struct WireHeader {
-    kind: u8,
-    flags: u8,
-    seq: u32,
-    eui64: Eui64,
-    nwk: Nwk,
-    epan: Eui64,
-}
-
-impl WireHeader {
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < HEADER_LEN || bytes[..2] != MAGIC || bytes[2] != VERSION {
-            return None;
-        }
-        Some(Self {
-            kind: bytes[3],
-            flags: bytes[4],
-            seq: u32::from_le_bytes(bytes[5..9].try_into().ok()?),
-            eui64: Eui64(bytes[9..17].try_into().ok()?),
-            nwk: Nwk(u16::from_le_bytes([bytes[17], bytes[18]])),
-            epan: Eui64(bytes[19..27].try_into().ok()?),
-        })
-    }
-
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 128);
-        out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        out.push(self.kind);
-        out.push(self.flags);
-        out.extend_from_slice(&self.seq.to_le_bytes());
-        out.extend_from_slice(&self.eui64.0);
-        out.extend_from_slice(&self.nwk.0.to_le_bytes());
-        out.extend_from_slice(&self.epan.0);
-        out
-    }
-}
-
-// -- minimal 802.15.4 MAC header parsing --------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MacAddress {
-    None,
-    Short(Nwk),
-    Extended(Eui64),
-}
-
-impl MacAddress {
-    const fn is_broadcast(&self) -> bool {
-        matches!(self, Self::Short(Nwk(0xFFFF)))
-    }
-}
-
-struct MacHeader {
-    frame_type: u8,
-    ack_request: bool,
-    dest: MacAddress,
-    source: MacAddress,
-}
-
-impl MacHeader {
-    fn parse(psdu: &[u8]) -> Option<Self> {
-        let fcf = u16::from_le_bytes([*psdu.first()?, *psdu.get(1)?]);
-        let ack_request = fcf & (1 << 5) != 0;
-        let pan_compression = fcf & (1 << 6) != 0;
-        let dest_mode = (fcf >> 10) & 0b11;
-        let src_mode = (fcf >> 14) & 0b11;
-
-        let mut i = 3; // FCF + sequence number
-        let mut read_addr = |mode: u16, with_pan: bool| -> Option<MacAddress> {
-            if mode == 0 {
-                return Some(MacAddress::None);
-            }
-            if with_pan {
-                i += 2;
-            }
-            match mode {
-                2 => {
-                    let nwk = u16::from_le_bytes([*psdu.get(i)?, *psdu.get(i + 1)?]);
-                    i += 2;
-                    Some(MacAddress::Short(Nwk(nwk)))
-                }
-                3 => {
-                    let eui64 = Eui64(psdu.get(i..i + 8)?.try_into().ok()?);
-                    i += 8;
-                    Some(MacAddress::Extended(eui64))
-                }
-                _ => None,
-            }
-        };
-        let dest = read_addr(dest_mode, true)?;
-        let source = read_addr(src_mode, !pan_compression)?;
-        Some(Self {
-            frame_type: (fcf & 0b111) as u8,
-            ack_request,
-            dest,
-            source,
-        })
     }
 }
 

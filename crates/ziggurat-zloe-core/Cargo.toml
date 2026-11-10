@@ -1,0 +1,15 @@
+[package]
+name = "ziggurat-zloe-core"
+version.workspace = true
+description = "SPIKE: the I/O-free logic of ZLOE (Zigbee Link Over Ethernet), shared by host and MCU"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ziggurat-ieee-802154.workspace = true
+ziggurat-phy.workspace = true
+
+tracing = { version = "0.1", default-features = false }

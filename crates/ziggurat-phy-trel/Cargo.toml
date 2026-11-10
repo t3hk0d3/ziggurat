@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 ziggurat-ieee-802154.workspace = true
 ziggurat-phy.workspace = true
+ziggurat-zloe-core.workspace = true
 
 parking_lot = "0.12.5"
 tokio = { version = "1.53.1", features = ["rt", "time", "sync", "net", "macros"] }

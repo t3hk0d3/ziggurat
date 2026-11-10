@@ -2225,6 +2225,7 @@ dependencies = [
  "tracing-subscriber",
  "ziggurat-ieee-802154",
  "ziggurat-phy",
+ "ziggurat-zloe-core",
 ]
 
 [[package]]
@@ -2305,4 +2306,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "ziggurat-ieee-802154",
+]
+
+[[package]]
+name = "ziggurat-zloe-core"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "ziggurat-ieee-802154",
+ "ziggurat-phy",
 ]
