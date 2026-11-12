@@ -276,7 +276,7 @@ fn acked_on_a_retry_returns_true() {
 }
 
 #[test]
-fn three_tries_without_ack_lower_health_and_rotate() {
+fn three_tries_without_ack_lower_health_and_rotate_but_keep_full_lqi() {
     let core = core_with(None);
     add_peer(&core, &[addr(2), addr(3)]);
     assert!(!block_on(core.send_unicast(addr(2), &[1], true)));
@@ -284,7 +284,11 @@ fn three_tries_without_ack_lower_health_and_rotate() {
     core.state.with(|s| {
         let peer = &s.peers[&PEER];
         assert!(peer.health < 1.0);
-        assert!(peer.lqi() < 255);
+        assert_eq!(
+            peer.lqi(),
+            255,
+            "frames from the peer still report a working link"
+        );
         assert_eq!(peer.addr, addr(3));
     });
 }

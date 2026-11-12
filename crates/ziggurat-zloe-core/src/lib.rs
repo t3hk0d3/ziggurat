@@ -1,7 +1,7 @@
 //! SPIKE (throwaway): the logic of ZLOE (Zigbee Link Over Ethernet) without any I/O, shared
 //! by the host (`ziggurat-phy-trel`) and the MCU (`ziggurat-ot`), so both keep one
 //! implementation: identity, peer table, backbone first with the radio on failure, per-frame
-//! ack and retries, duplicate drop, LQI from backbone health, dropping air copies.
+//! ack and retries, duplicate drop, LQI 255 for backbone frames (as TREL), dropping air copies.
 //!
 //! Locks, clocks and sockets are behind [`CoreLock`], [`Clock`] and [`BackboneTransport`].
 //! [`ZloeState`] is the plain state; [`ZloeCore`] ties it to those three.
@@ -298,10 +298,13 @@ impl Peer {
             .is_some_and(|t| now.saturating_sub(t) < BACKBONE_LIVE_MS)
     }
 
+    /// What frames from this peer report: a datagram arrived, so the link works. Unanswered
+    /// sends only drive retries, rotation and the radio fallback (`health` is diagnostics): a
+    /// score kept from them would stick, since a costly link is no longer used and never
+    /// earns a success back.
     #[must_use]
-    pub fn lqi(&self) -> u8 {
-        // Positive, so `+ 0.5` rounds; `as` saturates at 255
-        ((self.health * 255.0 + 0.5) as u8).max(1)
+    pub const fn lqi(&self) -> u8 {
+        255
     }
 
     pub fn record(&mut self, acked: bool) {
