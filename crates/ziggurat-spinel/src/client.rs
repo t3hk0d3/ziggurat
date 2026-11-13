@@ -3,6 +3,8 @@ use crate::{
     SpinelFramePropValueIs, SpinelHeader, SpinelPropertyId, SpinelProtocol, SpinelResetReason,
     SpinelStatus, hdlc_escape_into, packed_uint21_deserialize, packed_uint21_to_bytes,
 };
+use std::future::Future;
+use std::pin::Pin;
 use std::string::String;
 use thiserror::Error;
 use ziggurat_ieee_802154::FrameBytes;
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
 
 /// A link to the RCP: a serial port or a TCP socket. Boxed so [`SpinelClient`] stays
 /// transport-agnostic regardless of which one a caller opens.
@@ -30,6 +32,96 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// Consecutive command timeouts before the RCP is presumed wedged and the
 /// reset-recovery path is triggered.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 4;
+
+/// Opens a fresh link to the RCP, used to reconnect after the old one died. Called once
+/// per attempt, so a device path is resolved again each time (a re-enumerated USB board
+/// may come back on another tty behind the same `/dev/serial/by-id/` symlink).
+pub type TransportOpener = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn RcpTransport>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How the reader reopens a lost RCP link: exponential backoff from `initial_backoff`,
+/// capped at `max_backoff`, abandoned once `give_up_after` has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub give_up_after: Duration,
+    /// Also presume the link dead, and reopen it, after `MAX_CONSECUTIVE_TIMEOUTS`
+    /// command timeouts. Catches links that die without an EOF: a TCP peer that
+    /// vanished, or a serial-to-TCP bridge that kept TCP up while its serial port went.
+    pub reopen_on_unresponsive: bool,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(5),
+            give_up_after: Duration::from_secs(60),
+            reopen_on_unresponsive: false,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// The delay before reopen attempt `attempt`, counting from 1.
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+}
+
+#[derive(Clone)]
+struct Reconnect {
+    opener: TransportOpener,
+    policy: ReconnectPolicy,
+}
+
+impl Reconnect {
+    /// Retry the opener with backoff until it succeeds or the policy's budget runs out.
+    async fn reopen(&self) -> Option<Box<dyn RcpTransport>> {
+        let started = Instant::now();
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+            let delay = self.policy.backoff(attempt);
+            if started.elapsed() + delay > self.policy.give_up_after {
+                tracing::error!(
+                    "Giving up on the RCP link after {} attempts over {:?}",
+                    attempt - 1,
+                    started.elapsed()
+                );
+                return None;
+            }
+
+            sleep(delay).await;
+
+            match (self.opener)().await {
+                Ok(transport) => {
+                    tracing::info!("RCP link reopened on attempt {attempt}");
+                    return Some(transport);
+                }
+                Err(err) => {
+                    tracing::warn!("Reopening the RCP link failed (attempt {attempt}): {err}");
+                }
+            }
+        }
+    }
+}
+
+/// Set after a reopen: if the RCP has not announced a reset by `deadline` (the
+/// protocol's reset count is still `seen`), one is synthesized so recovery still runs.
+#[derive(Clone, Copy)]
+struct ResetWatch {
+    deadline: Instant,
+    seen: u64,
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SpinelTxFrame {
@@ -245,30 +337,50 @@ pub struct SpinelClient {
     reader: Mutex<Option<ReadHalf<Box<dyn RcpTransport>>>>,
     /// The writer half of the port. The mutex also serializes outbound HDLC writes so
     /// concurrent commands cannot interleave partial frames inside the byte stream.
-    writer: AsyncMutex<SpinelWriter>,
+    writer: Arc<AsyncMutex<SpinelWriter>>,
     pub protocol: Arc<Mutex<SpinelProtocol>>,
     /// Functional ownership of the radio (scan, reset recovery, channel retune), taken via
     /// [`Self::lock_radio`].
     exclusive_lock: AsyncMutex<()>,
     consecutive_timeouts: AtomicU32,
+    /// How to reopen the link when it dies; `None` makes a dead link fatal.
+    reconnect: Option<Reconnect>,
+    /// Tells the reader the RCP stopped answering, per
+    /// [`ReconnectPolicy::reopen_on_unresponsive`]. Capacity 1: one pending signal is
+    /// enough.
+    unresponsive_tx: mpsc::Sender<()>,
+    unresponsive_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl SpinelClient {
     pub fn new(port: Box<dyn RcpTransport>) -> Self {
         let (reader, writer) = tokio::io::split(port);
+        let (unresponsive_tx, unresponsive_rx) = mpsc::channel(1);
 
         Self {
             reader: Mutex::new(Some(reader)),
-            writer: AsyncMutex::new(SpinelWriter {
+            writer: Arc::new(AsyncMutex::new(SpinelWriter {
                 port: writer,
                 frame_scratch: Vec::with_capacity(SPINEL_FRAME_MAX_SIZE),
                 // Worst-case HDLC escaping doubles the frame, plus two flags
                 hdlc_scratch: Vec::with_capacity(2 * SPINEL_FRAME_MAX_SIZE + 2),
-            }),
+            })),
             protocol: Arc::new(Mutex::new(SpinelProtocol::new())),
             exclusive_lock: AsyncMutex::new(()),
             consecutive_timeouts: AtomicU32::new(0),
+            reconnect: None,
+            unresponsive_tx,
+            unresponsive_rx: Mutex::new(Some(unresponsive_rx)),
         }
+    }
+
+    /// Reopen the link with `opener` when it hits EOF or a read error, instead of
+    /// exiting. After a reopen the RCP is reset, and its reset notification drives the
+    /// usual reset recovery, which reprograms the radio.
+    #[must_use]
+    pub fn with_reconnect(mut self, opener: TransportOpener, policy: ReconnectPolicy) -> Self {
+        self.reconnect = Some(Reconnect { opener, policy });
+        self
     }
 
     pub fn set_property_update_receiver(
@@ -292,9 +404,21 @@ impl SpinelClient {
 
     /// Start a reading loop to parse and handle inbound frames.
     ///
-    /// Serial death (USB yank, EOF) exits the whole process: the supervisor (Docker)
-    /// restarts us. A half-dead process with a deaf radio is the worst failure mode.
+    /// A dead link (USB yank, EOF) is reopened per [`Self::with_reconnect`]. Once that
+    /// fails, or without it, the whole process exits: the supervisor (Docker) restarts
+    /// us. A half-dead process with a deaf radio is the worst failure mode.
     pub fn spawn_reader(&self) {
+        let reader = self.reader_task();
+
+        tokio::spawn(async move {
+            reader.await;
+            tracing::error!("RCP link lost, exiting");
+            std::process::exit(1);
+        });
+    }
+
+    /// The reading loop, resolving only once the link is lost for good.
+    pub(crate) fn reader_task(&self) -> impl Future<Output = ()> + Send + 'static {
         let mut reader = self
             .reader
             .lock()
@@ -302,73 +426,91 @@ impl SpinelClient {
             .take()
             .expect("Reader already taken");
         let protocol = Arc::clone(&self.protocol);
+        let writer = Arc::clone(&self.writer);
+        let reconnect = self.reconnect.clone();
+        let mut unresponsive_rx = self
+            .unresponsive_rx
+            .lock()
+            .expect("Failed to lock unresponsive receiver")
+            .take()
+            .expect("Unresponsive receiver already taken");
 
-        tokio::spawn(async move {
+        async move {
             let mut buffer = [0u8; 2048];
+            let mut reset_watch: Option<ResetWatch> = None;
 
             loop {
-                match reader.read(&mut buffer).await {
+                let watch_deadline = reset_watch.map_or_else(Instant::now, |w| w.deadline);
+                let read = tokio::select! {
+                    read = reader.read(&mut buffer) => read,
+                    () = sleep_until(watch_deadline), if reset_watch.is_some() => {
+                        let watch = reset_watch.take().expect("Reset watch is set");
+                        let mut protocol = protocol.lock().expect("Failed to lock Spinel");
+                        if protocol.reset_count == watch.seen {
+                            tracing::warn!(
+                                "RCP did not announce its reset after the reopen, recovering anyway"
+                            );
+                            protocol.notify_reset(SpinelStatus::ResetUnknown);
+                        }
+                        continue;
+                    }
+                    Some(()) = unresponsive_rx.recv() => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "RCP unresponsive, presuming the link dead",
+                    )),
+                };
+
+                match read {
                     Ok(n) if n > 0 => {
                         let mut protocol = protocol.lock().expect("Failed to lock Spinel");
-                        protocol.handle_inbound_bytes(&buffer[..n])
+                        protocol.handle_inbound_bytes(&buffer[..n]);
+                        continue;
                     }
-                    Ok(_) => {
-                        tracing::error!("Serial port EOF, exiting");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        tracing::error!("Serial port read failed ({e}), exiting");
-                        std::process::exit(1);
-                    }
+                    Ok(_) => tracing::error!("Serial port EOF"),
+                    Err(e) => tracing::error!("Serial port read failed ({e})"),
+                }
+
+                // Nothing in flight can be answered over the dead link
+                protocol
+                    .lock()
+                    .expect("Failed to lock Spinel")
+                    .fail_all_pending_requests();
+
+                let Some(reconnect) = &reconnect else {
+                    return;
+                };
+                let Some(transport) = reconnect.reopen().await else {
+                    return;
+                };
+
+                let (new_reader, new_writer) = tokio::io::split(transport);
+                reader = new_reader;
+                writer.lock().await.port = new_writer;
+                // Timeouts piled up against the old link say nothing about the new one
+                while unresponsive_rx.try_recv().is_ok() {}
+
+                // Same as startup: reset the RCP. Its reset notification triggers the
+                // driver's reset recovery, which reprograms the radio
+                let seen = protocol.lock().expect("Failed to lock Spinel").reset_count;
+                reset_watch = Some(ResetWatch {
+                    deadline: Instant::now() + TIMEOUT,
+                    seen,
+                });
+                if let Err(e) = write_frame(&writer, &reset_frame(SpinelResetReason::Stack)).await {
+                    tracing::warn!("Failed to reset the RCP after the reopen: {e}");
                 }
             }
-        });
+        }
     }
 
-    /// Serialize and HDLC-frame `frame` into the writer's persistent scratch buffers
-    /// and put it on the wire.
-    // The writer lock is intentionally held until the write completes: it is what
-    // serializes outbound frames on the wire
-    #[allow(clippy::significant_drop_tightening)]
     async fn send_frame(&self, frame: &SpinelFrame) -> Result<(), SpinelError> {
-        let mut writer = self.writer.lock().await;
-        let SpinelWriter {
-            port,
-            frame_scratch,
-            hdlc_scratch,
-        } = &mut *writer;
-
-        frame_scratch.clear();
-        frame.serialize_into(frame_scratch);
-
-        hdlc_scratch.clear();
-        hdlc_scratch.push(HdlcSpecial::Flag as u8);
-        hdlc_escape_into(frame_scratch, hdlc_scratch);
-        hdlc_scratch.push(HdlcSpecial::Flag as u8);
-
-        tracing::trace!("Writing {hdlc_scratch:02X?}");
-
-        port.write_all(hdlc_scratch)
-            .await
-            .map_err(SpinelError::IoError)?;
-
-        Ok(())
+        write_frame(&self.writer, frame).await
     }
 
     /// `CMD_RESET` is acknowledged with an unsolicited `LastStatus = RESET_*`
     /// notification rather than a tid-matched response, so this only sends.
     pub async fn send_reset(&self, reason: SpinelResetReason) -> Result<(), SpinelError> {
-        let frame = SpinelFrame {
-            header: SpinelHeader {
-                flag: 0b10,
-                network_link_id: 0,
-                transaction_id: 0,
-            },
-            command_id: SpinelCommandId::Reset,
-            payload: vec![reason as u8],
-        };
-
-        self.send_frame(&frame).await
+        self.send_frame(&reset_frame(reason)).await
     }
 
     pub async fn send_command(
@@ -409,13 +551,24 @@ impl SpinelClient {
                 let timeouts = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                 if timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
                     self.consecutive_timeouts.store(0, Ordering::Relaxed);
-                    tracing::error!(
-                        "RCP unresponsive after {timeouts} consecutive command timeouts, triggering reset recovery"
-                    );
-                    self.protocol
-                        .lock()
-                        .expect("Failed to lock Spinel")
-                        .notify_reset(SpinelStatus::ResponseTimeout);
+                    if self
+                        .reconnect
+                        .as_ref()
+                        .is_some_and(|r| r.policy.reopen_on_unresponsive)
+                    {
+                        tracing::error!(
+                            "RCP unresponsive after {timeouts} consecutive command timeouts, reopening the link"
+                        );
+                        let _ = self.unresponsive_tx.try_send(());
+                    } else {
+                        tracing::error!(
+                            "RCP unresponsive after {timeouts} consecutive command timeouts, triggering reset recovery"
+                        );
+                        self.protocol
+                            .lock()
+                            .expect("Failed to lock Spinel")
+                            .notify_reset(SpinelStatus::ResponseTimeout);
+                    }
                 }
 
                 Err(SpinelError::Timeout)
@@ -563,6 +716,51 @@ impl SpinelClient {
     }
 }
 
+fn reset_frame(reason: SpinelResetReason) -> SpinelFrame {
+    SpinelFrame {
+        header: SpinelHeader {
+            flag: 0b10,
+            network_link_id: 0,
+            transaction_id: 0,
+        },
+        command_id: SpinelCommandId::Reset,
+        payload: vec![reason as u8],
+    }
+}
+
+/// Serialize and HDLC-frame `frame` into the writer's persistent scratch buffers
+/// and put it on the wire.
+// The writer lock is intentionally held until the write completes: it is what
+// serializes outbound frames on the wire
+#[allow(clippy::significant_drop_tightening)]
+async fn write_frame(
+    writer: &AsyncMutex<SpinelWriter>,
+    frame: &SpinelFrame,
+) -> Result<(), SpinelError> {
+    let mut writer = writer.lock().await;
+    let SpinelWriter {
+        port,
+        frame_scratch,
+        hdlc_scratch,
+    } = &mut *writer;
+
+    frame_scratch.clear();
+    frame.serialize_into(frame_scratch);
+
+    hdlc_scratch.clear();
+    hdlc_scratch.push(HdlcSpecial::Flag as u8);
+    hdlc_escape_into(frame_scratch, hdlc_scratch);
+    hdlc_scratch.push(HdlcSpecial::Flag as u8);
+
+    tracing::trace!("Writing {hdlc_scratch:02X?}");
+
+    port.write_all(hdlc_scratch)
+        .await
+        .map_err(SpinelError::IoError)?;
+
+    Ok(())
+}
+
 /// Functional ownership of the radio, handed out by [`SpinelClient::lock_radio`].
 pub struct ExclusiveRadio<'a> {
     client: &'a SpinelClient,
@@ -576,5 +774,399 @@ impl ExclusiveRadio<'_> {
         tx_frame: &SpinelTxFrame,
     ) -> Result<SpinelStatus, SpinelError> {
         self.client.transmit_frame_inner(tx_frame).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SpinelFramePropValueIs;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{DuplexStream, ReadBuf, duplex};
+    use tokio::time::Instant;
+
+    /// One scripted result per reopen attempt; once exhausted, every attempt fails.
+    type Script = Arc<Mutex<VecDeque<io::Result<Box<dyn RcpTransport>>>>>;
+
+    /// An opener replaying `script` and recording the instant of every attempt.
+    fn scripted_opener(script: Script, attempts: Arc<Mutex<Vec<Instant>>>) -> TransportOpener {
+        Arc::new(move || {
+            attempts.lock().unwrap().push(Instant::now());
+            let next = script.lock().unwrap().pop_front();
+            Box::pin(async move {
+                next.unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::NotFound)))
+            })
+        })
+    }
+
+    fn not_found() -> io::Result<Box<dyn RcpTransport>> {
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    /// A fake RCP link: the client end as a transport, and the RCP's end for the test.
+    fn link() -> (Box<dyn RcpTransport>, DuplexStream) {
+        let (host, rcp) = duplex(4096);
+        (Box::new(host), rcp)
+    }
+
+    /// A transport whose every read fails, as a yanked USB serial port does.
+    struct BrokenTransport;
+
+    impl AsyncRead for BrokenTransport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other(
+                "device reports readiness to read but returned no data",
+            )))
+        }
+    }
+
+    impl AsyncWrite for BrokenTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn hdlc(frame: &SpinelFrame) -> Vec<u8> {
+        let mut out = vec![HdlcSpecial::Flag as u8];
+        hdlc_escape_into(&frame.to_bytes(), &mut out);
+        out.push(HdlcSpecial::Flag as u8);
+        out
+    }
+
+    fn reset_command() -> Vec<u8> {
+        hdlc(&SpinelFrame {
+            header: SpinelHeader {
+                flag: 0b10,
+                network_link_id: 0,
+                transaction_id: 0,
+            },
+            command_id: SpinelCommandId::Reset,
+            payload: vec![SpinelResetReason::Stack as u8],
+        })
+    }
+
+    fn reset_announcement(status: SpinelStatus) -> Vec<u8> {
+        hdlc(&SpinelFrame {
+            header: SpinelHeader {
+                flag: 0b10,
+                network_link_id: 0,
+                transaction_id: 0,
+            },
+            command_id: SpinelCommandId::PropValueIs,
+            payload: SpinelFramePropValueIs {
+                property_id: SpinelPropertyId::LastStatus,
+                value: packed_uint21_to_bytes(status as u32),
+            }
+            .to_bytes(),
+        })
+    }
+
+    async fn read_exactly(rcp: &mut DuplexStream, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        rcp.read_exact(&mut buf).await.unwrap();
+        buf
+    }
+
+    struct Harness {
+        client: Arc<SpinelClient>,
+        attempts: Arc<Mutex<Vec<Instant>>>,
+        resets: mpsc::Receiver<SpinelStatus>,
+        reader: tokio::task::JoinHandle<()>,
+    }
+
+    /// A client on `initial`, reconnecting per `script` under the default policy, with
+    /// its reader running as a task.
+    fn harness(
+        initial: Box<dyn RcpTransport>,
+        script: Vec<io::Result<Box<dyn RcpTransport>>>,
+    ) -> Harness {
+        harness_with(ReconnectPolicy::default(), initial, script)
+    }
+
+    fn harness_with(
+        policy: ReconnectPolicy,
+        initial: Box<dyn RcpTransport>,
+        script: Vec<io::Result<Box<dyn RcpTransport>>>,
+    ) -> Harness {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let opener = scripted_opener(
+            Arc::new(Mutex::new(script.into_iter().collect())),
+            Arc::clone(&attempts),
+        );
+        let client = Arc::new(SpinelClient::new(initial).with_reconnect(opener, policy));
+        let (reset_tx, resets) = mpsc::channel(8);
+        client.set_reset_notification_receiver(reset_tx);
+        let reader = tokio::spawn(client.reader_task());
+
+        Harness {
+            client,
+            attempts,
+            resets,
+            reader,
+        }
+    }
+
+    fn offsets(attempts: &[Instant], start: Instant) -> Vec<Duration> {
+        attempts.iter().map(|at| *at - start).collect()
+    }
+
+    #[test]
+    fn backoff_doubles_from_initial_and_caps_at_max() {
+        let policy = ReconnectPolicy::default();
+        let delays: Vec<_> = (1..=6).map(|n| policy.backoff(n)).collect();
+
+        assert_eq!(
+            delays,
+            [500, 1000, 2000, 4000, 5000, 5000].map(Duration::from_millis)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_reopens_with_backoff_and_resets_the_rcp() {
+        let (initial, rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        let h = harness(initial, vec![not_found(), not_found(), Ok(fresh)]);
+
+        let start = Instant::now();
+        drop(rcp_old);
+
+        let reset = reset_command();
+        assert_eq!(read_exactly(&mut rcp_new, reset.len()).await, reset);
+        assert_eq!(
+            offsets(&h.attempts.lock().unwrap(), start),
+            [500, 1500, 3500].map(Duration::from_millis)
+        );
+        assert!(!h.reader.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_fails_pending_commands_with_cancelled_by_reset() {
+        let (initial, rcp_old) = link();
+        let (fresh, _rcp_new) = link();
+        let h = harness(initial, vec![Ok(fresh)]);
+
+        let client = Arc::clone(&h.client);
+        let pending = tokio::spawn(async move {
+            client
+                .prop_value_get_once(SpinelPropertyId::NcpVersion)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(rcp_old);
+
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(SpinelError::CancelledByReset)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rcp_reset_announcement_on_the_new_link_reaches_the_reset_receiver() {
+        let (initial, rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        let mut h = harness(initial, vec![Ok(fresh)]);
+        drop(rcp_old);
+
+        let reset = reset_command();
+        read_exactly(&mut rcp_new, reset.len()).await;
+        rcp_new
+            .write_all(&reset_announcement(SpinelStatus::ResetSoftware))
+            .await
+            .unwrap();
+
+        assert_eq!(h.resets.recv().await, Some(SpinelStatus::ResetSoftware));
+        // The announcement satisfied the watchdog: no synthesized reset follows
+        tokio::time::sleep(TIMEOUT * 2).await;
+        assert!(h.resets.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_rcp_after_reopen_gets_a_synthesized_reset() {
+        let (initial, rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        let mut h = harness(initial, vec![Ok(fresh)]);
+        drop(rcp_old);
+
+        let reset = reset_command();
+        read_exactly(&mut rcp_new, reset.len()).await;
+        let sent = Instant::now();
+
+        assert_eq!(h.resets.recv().await, Some(SpinelStatus::ResetUnknown));
+        assert_eq!(Instant::now() - sent, TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_error_is_handled_like_eof() {
+        let (fresh, mut rcp_new) = link();
+        let h = harness(Box::new(BrokenTransport), vec![Ok(fresh)]);
+
+        let reset = reset_command();
+        assert_eq!(read_exactly(&mut rcp_new, reset.len()).await, reset);
+        assert_eq!(h.attempts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_once_the_reconnect_budget_is_spent() {
+        let (initial, rcp_old) = link();
+        let h = harness(initial, Vec::new());
+
+        let start = Instant::now();
+        drop(rcp_old);
+        h.reader.await.unwrap();
+
+        let budget = ReconnectPolicy::default().give_up_after;
+        let attempts = offsets(&h.attempts.lock().unwrap(), start);
+        assert!(!attempts.is_empty());
+        assert!(attempts.iter().all(|at| *at <= budget));
+        assert!(Instant::now() - start <= budget);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_reconnect_eof_ends_the_reader_at_once() {
+        let (initial, rcp_old) = link();
+        let client = SpinelClient::new(initial);
+        let reader = tokio::spawn(client.reader_task());
+
+        let start = Instant::now();
+        drop(rcp_old);
+        reader.await.unwrap();
+
+        assert_eq!(Instant::now(), start);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commands_work_again_over_the_new_link() {
+        let (initial, rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        let h = harness(initial, vec![Ok(fresh)]);
+        drop(rcp_old);
+
+        let reset = reset_command();
+        read_exactly(&mut rcp_new, reset.len()).await;
+
+        let client = Arc::clone(&h.client);
+        let version = tokio::spawn(async move { client.get_ncp_version().await });
+
+        // Answer the request with the tid it was sent with
+        let mut request = vec![0u8; 64];
+        let n = rcp_new.read(&mut request).await.unwrap();
+        let mut unescaped = Vec::new();
+        crate::hdlc_unescape_into(&request[..n], &mut unescaped).unwrap();
+        let tid = SpinelHeader::from_bytes(&unescaped).unwrap().transaction_id;
+        let mut payload = packed_uint21_to_bytes(SpinelPropertyId::NcpVersion as u32);
+        payload.extend_from_slice(b"OPENTHREAD/test\0");
+        rcp_new
+            .write_all(&hdlc(&SpinelFrame {
+                header: SpinelHeader {
+                    flag: 0b10,
+                    network_link_id: 0,
+                    transaction_id: tid,
+                },
+                command_id: SpinelCommandId::PropValueIs,
+                payload,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(version.await.unwrap().unwrap(), "OPENTHREAD/test");
+    }
+
+    const REOPEN_ON_UNRESPONSIVE: ReconnectPolicy = ReconnectPolicy {
+        initial_backoff: Duration::from_millis(500),
+        max_backoff: Duration::from_secs(5),
+        give_up_after: Duration::from_secs(60),
+        reopen_on_unresponsive: true,
+    };
+
+    /// Send commands one after another to a silent RCP until `count` have timed out. A
+    /// command in flight when the link is presumed dead is cancelled instead.
+    async fn time_out_commands(client: &SpinelClient, count: u32) {
+        let mut timeouts = 0;
+        while timeouts < count {
+            match client
+                .prop_value_get_once(SpinelPropertyId::NcpVersion)
+                .await
+            {
+                Err(SpinelError::Timeout) => timeouts += 1,
+                Err(SpinelError::CancelledByReset) => {}
+                other => panic!("unexpected result {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reopen_on_unresponsive_is_off_by_default() {
+        assert!(!ReconnectPolicy::default().reopen_on_unresponsive);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresponsive_link_is_reopened_when_enabled() {
+        // The old link stays open but silent, like a TCP peer that vanished
+        let (initial, _rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        let mut h = harness_with(REOPEN_ON_UNRESPONSIVE, initial, vec![Ok(fresh)]);
+
+        time_out_commands(&h.client, MAX_CONSECUTIVE_TIMEOUTS).await;
+        let stalled = Instant::now();
+
+        let reset = reset_command();
+        assert_eq!(read_exactly(&mut rcp_new, reset.len()).await, reset);
+        assert_eq!(
+            offsets(&h.attempts.lock().unwrap(), stalled),
+            [ReconnectPolicy::default().initial_backoff]
+        );
+        assert!(h.resets.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeouts_during_a_reopen_do_not_drop_the_new_link() {
+        let (initial, _rcp_old) = link();
+        let (fresh, mut rcp_new) = link();
+        // Five failures: the sixth attempt succeeds 12.5 s in
+        let mut script: Vec<_> = (0..5).map(|_| not_found()).collect();
+        script.push(Ok(fresh));
+        let h = harness_with(REOPEN_ON_UNRESPONSIVE, initial, script);
+
+        time_out_commands(&h.client, MAX_CONSECUTIVE_TIMEOUTS).await;
+        // The writer still points at the old silent link until the reopen succeeds
+        time_out_commands(&h.client, MAX_CONSECUTIVE_TIMEOUTS).await;
+
+        let reset = reset_command();
+        read_exactly(&mut rcp_new, reset.len()).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        assert_eq!(h.attempts.lock().unwrap().len(), 6);
+        assert!(!h.reader.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unresponsive_link_gets_a_reset_by_default() {
+        let (initial, _rcp_old) = link();
+        let mut h = harness(initial, Vec::new());
+
+        time_out_commands(&h.client, MAX_CONSECUTIVE_TIMEOUTS).await;
+
+        assert_eq!(h.resets.try_recv(), Ok(SpinelStatus::ResponseTimeout));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(h.attempts.lock().unwrap().is_empty());
     }
 }

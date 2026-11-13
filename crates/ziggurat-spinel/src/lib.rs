@@ -589,6 +589,9 @@ pub struct SpinelProtocol {
     pub unsolicited_frame_receiver: Option<mpsc::Sender<SpinelFrame>>,
     pub property_update_receivers: HashMap<SpinelPropertyId, mpsc::Sender<SpinelFramePropValueIs>>,
     pub reset_notification_receiver: Option<mpsc::Sender<SpinelStatus>>,
+    /// Resets seen so far, announced or synthesized. Lets a watcher tell whether a reset
+    /// happened since it last looked.
+    pub reset_count: u64,
 }
 
 impl Default for SpinelProtocol {
@@ -608,6 +611,7 @@ impl SpinelProtocol {
             unsolicited_frame_receiver: None,
             property_update_receivers: HashMap::new(),
             reset_notification_receiver: None,
+            reset_count: 0,
         }
     }
 
@@ -635,6 +639,7 @@ impl SpinelProtocol {
 
     pub fn notify_reset(&mut self, status: SpinelStatus) {
         self.fail_all_pending_requests();
+        self.reset_count += 1;
 
         if let Some(tx) = &self.reset_notification_receiver {
             let _ = tx.try_send(status);

@@ -22,7 +22,7 @@ use ziggurat_driver::ziggurat_ieee_802154::types::{Eui64, Nwk, PanId};
 use ziggurat_phy::{RadioConfig, RadioPhy, Receiver};
 use ziggurat_phy_spinel::SpinelPhy;
 use ziggurat_protocol::{self as proto};
-use ziggurat_spinel::client::{RcpTransport, SpinelClient};
+use ziggurat_spinel::client::{RcpTransport, ReconnectPolicy, SpinelClient, TransportOpener};
 
 /// Outbound frames a connection can queue before it is considered too slow and
 /// disconnected. Received frames dominate the traffic; a client that cannot keep up
@@ -162,7 +162,10 @@ impl ZigguratServer {
         }
 
         let transport = open_transport(&self.serial).await?;
-        let new_phy = Arc::new(SpinelPhy::new(Arc::new(SpinelClient::new(transport))));
+        let new_phy = Arc::new(SpinelPhy::new(Arc::new(spinel_client(
+            &self.serial,
+            transport,
+        ))));
         *phy = Some(new_phy.clone());
         drop(phy);
 
@@ -918,11 +921,48 @@ impl From<FlowControlMode> for FlowControl {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SerialConfig {
     device: String,
     baudrate: u32,
     flow_control: FlowControlMode,
+    /// How long to keep reopening a lost RCP link; zero exits at once
+    reconnect_timeout: Duration,
+    /// Also reopen the link when the RCP stops answering commands
+    reconnect_on_unresponsive: bool,
+}
+
+/// A Spinel client on `transport` that reopens `serial` with backoff when the link dies.
+fn spinel_client(serial: &SerialConfig, transport: Box<dyn RcpTransport>) -> SpinelClient {
+    let client = SpinelClient::new(transport);
+    if serial.reconnect_timeout.is_zero() {
+        return client;
+    }
+
+    let config = Arc::new(serial.clone());
+    let opener: TransportOpener = Arc::new(move || {
+        let config = Arc::clone(&config);
+        Box::pin(async move {
+            // Logged per attempt: a re-enumerated board shows up on a new tty behind the
+            // same `/dev/serial/by-id/` symlink
+            match std::fs::canonicalize(&config.device) {
+                Ok(path) => {
+                    tracing::info!("Reopening RCP link {} ({})", config.device, path.display())
+                }
+                Err(_) => tracing::info!("Reopening RCP link {}", config.device),
+            }
+            open_transport(&config).await
+        })
+    });
+
+    client.with_reconnect(
+        opener,
+        ReconnectPolicy {
+            give_up_after: serial.reconnect_timeout,
+            reopen_on_unresponsive: serial.reconnect_on_unresponsive,
+            ..ReconnectPolicy::default()
+        },
+    )
 }
 
 /// A local network hop should establish in well under this; past it, something (a
@@ -1000,6 +1040,18 @@ struct Args {
     #[arg(long, value_enum, default_value_t = FlowControlMode::Hardware)]
     flow_control: FlowControlMode,
 
+    /// Seconds to keep reopening the RCP link (with backoff) after it is lost, e.g. a
+    /// USB blip; the process exits once they run out. 0 exits at once
+    #[arg(long, default_value_t = 60)]
+    reconnect_timeout: u64,
+
+    /// Also treat the RCP link as lost, and reopen it, when the RCP stops answering
+    /// commands. For links that die without an EOF, e.g. a `tcp://` peer that vanished
+    /// or a serial-to-TCP bridge whose serial side went away. Needs a nonzero
+    /// --reconnect-timeout
+    #[arg(long)]
+    reconnect_on_unresponsive: bool,
+
     /// WebSocket listen address: `host:port` for TCP, `unix:/path/to.sock` for a
     /// UNIX socket
     #[arg(long, default_value = "0.0.0.0:9999")]
@@ -1040,6 +1092,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device: args.device,
             baudrate: args.baudrate,
             flow_control: args.flow_control,
+            reconnect_timeout: Duration::from_secs(args.reconnect_timeout),
+            reconnect_on_unresponsive: args.reconnect_on_unresponsive,
         }));
 
         match args.api {
