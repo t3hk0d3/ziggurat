@@ -33,9 +33,11 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 /// reset-recovery path is triggered.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 4;
 
-/// Opens a fresh link to the RCP, used to reconnect after the old one died. Called once
-/// per attempt, so a device path is resolved again each time (a re-enumerated USB board
-/// may come back on another tty behind the same `/dev/serial/by-id/` symlink).
+/// Opens a fresh link to the RCP, used to reconnect after the old one died.
+///
+/// Called once per attempt, so a device path is resolved again each time (a
+/// re-enumerated USB board may come back on another tty behind the same
+/// `/dev/serial/by-id/` symlink).
 pub type TransportOpener = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn RcpTransport>>> + Send>>
         + Send
@@ -452,6 +454,7 @@ impl SpinelClient {
                             );
                             protocol.notify_reset(SpinelStatus::ResetUnknown);
                         }
+                        drop(protocol);
                         continue;
                     }
                     Some(()) = unresponsive_rx.recv() => Err(std::io::Error::new(
@@ -462,8 +465,10 @@ impl SpinelClient {
 
                 match read {
                     Ok(n) if n > 0 => {
-                        let mut protocol = protocol.lock().expect("Failed to lock Spinel");
-                        protocol.handle_inbound_bytes(&buffer[..n]);
+                        protocol
+                            .lock()
+                            .expect("Failed to lock Spinel")
+                            .handle_inbound_bytes(&buffer[..n]);
                         continue;
                     }
                     Ok(_) => tracing::error!("Serial port EOF"),
