@@ -837,3 +837,63 @@ fn test_route_request_from_another_device_keeps_hints_distrusted() {
     assert!(receive(&mut routing, request, START));
     assert!(!routing.host_hints_trusted(DEVICE));
 }
+
+/// Receive a copy of the same route request at `path_cost`, as relayed by `NEIGHBOR`.
+fn receive_copy(routing: &mut Routing, path_cost: u8) -> RouteRequestOutcome {
+    routing.accept_route_request(
+        DEVICE,
+        1,
+        OWN,
+        NEIGHBOR,
+        path_cost,
+        NwkRouteRequestManyToOne::NotManyToOne,
+        START,
+        ROUTE_DISCOVERY_TIME,
+    )
+}
+
+#[test]
+fn test_first_copy_of_a_route_request_is_fresh() {
+    let mut routing = Routing::default();
+    let outcome = receive_copy(&mut routing, 3);
+    assert!(outcome.accepted);
+    assert!(outcome.fresh);
+}
+
+// Each retry of a request (the originator sends it several times, every relay several
+// more) arrives at the same cost. Relaying every one multiplied a single discovery into
+// a dozen broadcasts per relay.
+#[test]
+fn test_equal_cost_copy_is_accepted_but_not_fresh() {
+    let mut routing = Routing::default();
+    let _ = receive_copy(&mut routing, 3);
+    let outcome = receive_copy(&mut routing, 3);
+    assert!(outcome.accepted);
+    assert!(!outcome.fresh);
+}
+
+#[test]
+fn test_strictly_better_copy_is_fresh() {
+    let mut routing = Routing::default();
+    let _ = receive_copy(&mut routing, 3);
+    let outcome = receive_copy(&mut routing, 2);
+    assert!(outcome.accepted);
+    assert!(outcome.fresh);
+}
+
+#[test]
+fn test_worse_copy_is_neither_accepted_nor_fresh() {
+    let mut routing = Routing::default();
+    let _ = receive_copy(&mut routing, 3);
+    let outcome = receive_copy(&mut routing, 4);
+    assert!(!outcome.accepted);
+    assert!(!outcome.fresh);
+}
+
+#[test]
+fn test_equal_cost_copy_keeps_the_route_back_to_the_originator() {
+    let mut routing = Routing::default();
+    let _ = receive_copy(&mut routing, 3);
+    let _ = receive_copy(&mut routing, 3);
+    assert_eq!(routing.next_hop(DEVICE), Some(NEIGHBOR));
+}
