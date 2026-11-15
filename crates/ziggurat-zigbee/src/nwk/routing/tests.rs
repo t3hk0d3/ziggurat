@@ -775,3 +775,37 @@ fn test_own_discovery_matches_the_model_with_one_attempt() {
 fn test_own_discovery_matches_the_model_with_two_attempts() {
     check_every_short_sequence(2);
 }
+
+// A distrusted hint must not outlive the failure it came from: once a fresh route to
+// the device is known, the host's hints for it are trusted again.
+#[test]
+fn test_route_record_trusts_hints_for_the_source_again() {
+    let mut routing = Routing::default();
+    routing.distrust_host_hints(DEVICE);
+    routing.store_route_record(DEVICE, vec![ROUTER]);
+    assert!(routing.host_hints_trusted(DEVICE));
+}
+
+#[test]
+fn test_route_record_trusts_hints_for_its_relays_again() {
+    let mut routing = Routing::default();
+    routing.distrust_host_hints(ROUTER);
+    routing.store_route_record(DEVICE, vec![ROUTER]);
+    assert!(routing.host_hints_trusted(ROUTER));
+}
+
+#[test]
+fn test_answered_discovery_trusts_hints_again() {
+    let mut routing = Routing::default();
+    routing.distrust_host_hints(DEVICE);
+    answered_discovery(&mut routing, 1);
+    assert!(routing.host_hints_trusted(DEVICE));
+}
+
+#[test]
+fn test_route_record_from_another_device_keeps_hints_distrusted() {
+    let mut routing = Routing::default();
+    routing.distrust_host_hints(DEVICE);
+    routing.store_route_record(OTHER_DEVICE, vec![ROUTER]);
+    assert!(!routing.host_hints_trusted(DEVICE));
+}
